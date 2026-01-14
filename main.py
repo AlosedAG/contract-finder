@@ -11,7 +11,7 @@ def duckduckgo_search(query, max_results=20):
         page.goto("https://duckduckgo.com/", timeout=60000)
         page.wait_for_selector("input[name='q']")
 
-        # Type like a human
+        # Mimic human typing
         page.type("input[name='q']", query, delay=80)
         page.keyboard.press("Enter")
 
