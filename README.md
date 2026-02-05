@@ -1,41 +1,94 @@
-# Contract Finder
+Government Contract Search Tool v7.5
+A Python tool for discovering publicly available government contracts and pricing information for software vendors.
 
-A human-assisted government contract discovery tool using DuckDuckGo, Playwright and BeautifulSoup libraries.
+⚠️ Prototype Notice: This is a prototype/proof-of-concept implementation. The codebase consists of a single main file without proper architectural separation (no modules, classes split across files, or formal project structure). It is intended for demonstration and personal use rather than production deployment.
 
-## Design Decisions
 
-**Why Playwright instead of Selenium:**  
-Playwright provides faster, more reliable browser automation with modern features like built-in waiting, headless mode, and cross-browser support. Unlike Selenium, it handles dynamic content and modern JavaScript-heavy websites more gracefully, which is crucial for interacting with search engines and government portals that rely on dynamic loading. Playwright also allows for easy human-assisted automation when CAPTCHAs appear.
+What It Does
+This tool automates the process of researching how much government agencies pay for software products by:
 
-**Why DuckDuckGo instead of Google or Bing:**  
-DuckDuckGo was chosen because it does not require an API key, allows real-time web searching, and avoids the strict anti-bot measures that often block automated scripts on Google or Bing. This makes human-assisted automation faster and simpler while still returning high-quality government domain results.
+Searching the web for publicly available contract documents
+Filtering out irrelevant results (marketing sites, user manuals, etc.)
+Scoring and ranking results by relevance
+Extracting pricing, dates, and contract terms from PDF documents
+Identifying which cities, counties, and states have contracts with a vendor
 
-# Usage
-## Follow the prompts:
 
-Company name – The main company you want to search contracts for.
-Product name – The specific product or service offered by the company.
-Summary/context (optional) – Any additional information or description to give context. This is not required but can help keep track of your searches.
-Pages to crawl per search – Default is 5. You can increase this if you want more results, but it will take longer.
+Requirements
+Required Dependencies
+bashpip install playwright
+pip install requests
+pip install pdfplumber
+Optional (Faster PDF Processing)
+bashpip install pymupdf
+First-Time Setup
+After installing Playwright, you must install the browser:
+bashplaywright install chromium
 
-The tool will open a browser, type your queries into DuckDuckGo, and extract government links and PDFs. When a CAPTCHA appears, you can solve it manually; the tool will continue after you do so. Results are displayed in the console and can optionally be saved as JSON.
+Usage
+Run the script directly:
+bashpython gov_contract_search.py
+The program will prompt you for:
 
-## How it Works
+Company name — The software vendor to research (e.g., "Accela", "Tyler Technologies")
+Product name — The specific product to search for (e.g., "Civic Platform", "Munis")
+Search type — Software licenses, implementation services, or both
+Number of queries — How many search variations to run (more = broader results)
 
-1. The script opens a browser using Playwright.
-2. It types the company name into DuckDuckGo.
-3. It runs multiple search queries combining the company, product, and contract-related keywords.
-4. Results are scraped from the search results page, including titles and URLs.
-   
-Links are scored based on relevance:
-- Government domains (.gov, .us, etc.)
-- PDFs or pages containing “contract,” “agreement,” etc.
-- Mentions of the company and product in the title or URL
-- Duplicates are removed, and the highest-scoring results are shown.
-- You can optionally save results to data/results.json for later analysis.
 
-# Installation
+Features
+FeatureDescriptionSmart FilteringAutomatically excludes vendor marketing sites, review platforms, and user documentationRelevance ScoringRanks results 0-10 based on source trustworthiness, document type, and content signalsLocation DetectionIdentifies the city, county, or state associated with each contractLocation DiversityPrevents results from being dominated by a single jurisdictionLink ValidationTests each URL to verify the document is still accessiblePDF AnalysisDownloads and extracts pricing, dates, and contract terms from documentsContent ScoringRe-ranks results based on whether actual pricing was found in the document
 
-```bash
-pip install -r requirements.txt
-python -m playwright install
+Output
+Results are displayed in the terminal with:
+
+Relevance score and visual bar graph
+Document location (city/state)
+Document type classification
+Key findings (pricing amounts, contract terms, dates)
+Direct URL to the document
+
+Results can be saved to:
+
+JSON — Structured data with full metadata
+CSV — Spreadsheet-compatible format for easy review
+
+
+Document Types
+The tool classifies documents into six categories:
+TypeDescriptionLikely to Have Pricing?Order FormSpecific pricing and quantities✅ YesContract/AgreementFull contract terms✅ YesPricing DocumentFee schedules, cost exhibits✅ YesStaff Report/MemoGovernment summary documents⚠️ SometimesRFP/ProposalSolicitations and responses⚠️ Estimated onlyOther Government DocumentUncategorized❓ Unknown
+
+Blocked Domains
+The tool automatically filters out results from:
+
+Software vendor websites (marketing content)
+Review aggregators (G2, Capterra, Gartner, etc.)
+Bid platforms without direct document access
+News and press release sites
+Social media platforms
+User manual aggregator sites
+
+
+Limitations
+
+Prototype architecture — Single file, no modular structure
+Rate limiting — DuckDuckGo may temporarily block requests if too many searches are run
+Scanned PDFs — Cannot extract text from image-based/scanned documents
+Login-protected documents — Cannot access documents behind authentication
+Regional focus — Location detection is optimized for US government entities
+
+
+Example Output
+ 1. [████████░░]  8.0/10 HIGH ✓
+    📍 San Diego, CA
+    💰 [Order Form] Accela Civic Platform Renewal Order Form 2024.pdf
+    https://sandiego.gov/procurement/documents/accela-order-2024.pdf
+       💰 Annual Fee: $125,000
+       📅 3 years term
+       ✓ MENTIONS: Accela + Civic Platform
+
+License
+This project is provided as-is for research and educational purposes.
+
+Disclaimer
+This tool searches for publicly available government documents. Users are responsible for ensuring their use complies with applicable laws and terms of service. The tool does not access private, confidential, or login-protected information.
