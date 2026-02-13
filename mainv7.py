@@ -1,3 +1,18 @@
+"""
+GOVERNMENT CONTRACT SEARCH v7.5
+
+Required libraries (install before running):
+    pip install playwright
+    pip install requests
+    pip install pdfplumber
+
+Optional (faster PDF processing):
+    pip install pymupdf
+
+First-time setup for Playwright:
+    playwright install chromium
+"""
+
 from playwright.sync_api import sync_playwright
 import time
 import json
@@ -10,6 +25,30 @@ import requests
 from requests.exceptions import RequestException
 import tempfile
 import os
+
+# =============================================================================
+# PDF LIBRARY DETECTION (checked at runtime)
+# =============================================================================
+
+def check_pdf_libraries() -> Tuple[bool, bool]:
+    """Check which PDF libraries are available."""
+    has_pdfplumber = False
+    has_pymupdf = False
+    
+    try:
+        import pdfplumber
+        has_pdfplumber = True
+    except ImportError:
+        pass
+    
+    try:
+        import fitz  # PyMuPDF
+        has_pymupdf = True
+    except ImportError:
+        pass
+    
+    return has_pdfplumber, has_pymupdf
+
 
 # =============================================================================
 # CONFIGURATION
@@ -102,19 +141,18 @@ class SearchConfig:
         'price proposal': 1.5,
         'cost exhibit': 2.0,
         'pricing exhibit': 2.0,
-        'exhibit a': 1.0,  # Often pricing
+        'exhibit a': 1.0,
         'exhibit b': 1.0,
     }
 
 
 # =============================================================================
-# SIMPLIFIED DOCUMENT TYPES (reduced from 13 to 6)
+# SIMPLIFIED DOCUMENT TYPES (6 types)
 # =============================================================================
 
 class DocumentType:
     """Simplified document type classification."""
     
-    # Priority order (higher = better for pricing)
     TYPES = {
         'Order Form': {
             'patterns': ['order form', 'renewal order', 'purchase order'],
@@ -122,6 +160,7 @@ class DocumentType:
             'pricing_likely': True,
             'description': 'Specific pricing and quantities'
         },
+        
         'Contract/Agreement': {
             'patterns': ['agreement', 'contract', 'master service'],
             'exclude_patterns': ['item \\d+', 'agenda', 'staff report', 'memo'],
@@ -139,7 +178,7 @@ class DocumentType:
             'patterns': ['staff report', 'council report', 'agenda report', 'memo', 'memorandum', 
                         'item \\d+', 'board agenda', 'council agenda'],
             'priority': 4,
-            'pricing_likely': False,  # Summary only, not detailed pricing
+            'pricing_likely': False,
             'description': 'Government summary - may reference pricing'
         },
         'RFP/Proposal': {
@@ -149,7 +188,7 @@ class DocumentType:
             'description': 'Proposed/estimated pricing'
         },
         'Other Government Document': {
-            'patterns': [],  # Fallback
+            'patterns': [],
             'priority': 6,
             'pricing_likely': False,
             'description': 'Unknown - needs review'
@@ -161,22 +200,510 @@ class DocumentType:
         """Classify document and return (type_name, type_info)."""
         text = (url + " " + title).lower()
         
-        # Check in priority order
         for type_name, type_info in cls.TYPES.items():
             if type_name == 'Other Government Document':
-                continue  # Skip fallback
+                continue
             
-            # Check exclude patterns first (for Contract/Agreement)
             if 'exclude_patterns' in type_info:
                 if any(re.search(p, text) for p in type_info['exclude_patterns']):
-                    continue  # Skip this type, it's actually a staff report
+                    continue
             
-            # Check include patterns
             if any(re.search(p, text) for p in type_info['patterns']):
                 return type_name, type_info
         
-        # Fallback
         return 'Other Government Document', cls.TYPES['Other Government Document']
+
+
+# =============================================================================
+# PDF CONTENT EXTRACTION
+# =============================================================================
+
+def download_pdf(url: str, timeout: int = 30) -> Optional[bytes]:
+    """Download PDF content from URL."""
+    try:
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        }
+        response = requests.get(url, timeout=timeout, headers=headers, stream=True)
+        
+        if response.status_code == 200:
+            content_type = response.headers.get('content-type', '').lower()
+            if 'pdf' in content_type or 'octet-stream' in content_type or url.lower().endswith('.pdf'):
+                return response.content
+        return None
+    except Exception as e:
+        return None
+
+
+def extract_pdf_text(pdf_bytes: bytes, max_pages: int = 10) -> str:
+    """Extract text from PDF using available library."""
+    text = ""
+    
+    # Try PyMuPDF first (faster)
+    try:
+        import fitz
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        text_parts = []
+        for i, page in enumerate(doc):
+            if i >= max_pages:
+                break
+            text_parts.append(page.get_text())
+        doc.close()
+        text = "\n".join(text_parts)
+        if text.strip():
+            return text
+    except:
+        pass
+    
+    # Fall back to pdfplumber
+    try:
+        import pdfplumber
+        with tempfile.NamedTemporaryFile(suffix='.pdf', delete=False) as tmp:
+            tmp.write(pdf_bytes)
+            tmp_path = tmp.name
+        
+        text_parts = []
+        with pdfplumber.open(tmp_path) as pdf:
+            for i, page in enumerate(pdf.pages[:max_pages]):
+                page_text = page.extract_text()
+                if page_text:
+                    text_parts.append(page_text)
+        
+        os.unlink(tmp_path)
+        text = "\n".join(text_parts)
+    except:
+        pass
+    
+    return text
+
+
+# =============================================================================
+# DOCUMENT CONTENT ANALYSIS
+# =============================================================================
+
+class ContentAnalyzer:
+    """Analyze document content and generate summaries."""
+    
+    # Price patterns
+    PRICE_PATTERNS = [
+        (r'(?:total|contract|agreement)\s*(?:amount|value|price|cost)[:\s]*\$?([\d,]+(?:\.\d{2})?)', 'Total Value'),
+        (r'not[- ]to[- ]exceed[:\s]*\$?([\d,]+(?:\.\d{2})?)', 'Not to Exceed'),
+        (r'(?:annual|yearly)\s*(?:fee|cost|subscription|amount)[:\s]*\$?([\d,]+(?:\.\d{2})?)', 'Annual Fee'),
+        (r'(?:monthly)\s*(?:fee|cost|subscription)[:\s]*\$?([\d,]+(?:\.\d{2})?)', 'Monthly Fee'),
+        (r'(?:one[- ]time|implementation|setup)\s*(?:fee|cost)[:\s]*\$?([\d,]+(?:\.\d{2})?)', 'One-time Fee'),
+        (r'(?:license|licensing)\s*(?:fee|cost)[:\s]*\$?([\d,]+(?:\.\d{2})?)', 'License Fee'),
+        (r'(?:maintenance|support)\s*(?:fee|cost)[:\s]*\$?([\d,]+(?:\.\d{2})?)', 'Maintenance Fee'),
+        (r'(?:professional services|consulting|implementation services)[:\s]*\$?([\d,]+(?:\.\d{2})?)', 'Services Fee'),
+        (r'\$([\d,]+(?:\.\d{2})?)\s*(?:per year|annually|/year)', 'Per Year'),
+        (r'\$([\d,]+(?:\.\d{2})?)\s*(?:per month|monthly|/month)', 'Per Month'),
+    ]
+    
+    # Contract date patterns
+    DATE_PATTERNS = [
+        (r'(?:effective|start|commencement)\s*date[:\s]*([A-Za-z]+\s+\d{1,2},?\s+\d{4}|\d{1,2}[/-]\d{1,2}[/-]\d{4})', 'Effective Date'),
+        (r'(?:end|expiration|termination|expiry)\s*date[:\s]*([A-Za-z]+\s+\d{1,2},?\s+\d{4}|\d{1,2}[/-]\d{1,2}[/-]\d{4})', 'End Date'),
+        (r'(?:expire|expires|expiring|terminates?)\s*(?:on\s+)?([A-Za-z]+\s+\d{1,2},?\s+\d{4}|\d{1,2}[/-]\d{1,2}[/-]\d{4})', 'Expiration'),
+        (r'(?:through|until|ending)\s+([A-Za-z]+\s+\d{1,2},?\s+\d{4}|\d{1,2}[/-]\d{1,2}[/-]\d{4})', 'Valid Through'),
+    ]
+    
+    # Contract term patterns
+    TERM_PATTERNS = [
+        (r'(?:initial\s+)?term\s+(?:of\s+)?(\d+)\s*(?:year|yr)s?', 'Term'),
+        (r'(\d+)[- ]year\s+(?:term|agreement|contract)', 'Term'),
+        (r'(?:initial\s+)?term\s+(?:of\s+)?(\d+)\s*months?', 'Term (months)'),
+    ]
+    
+    # Pricing model indicators
+    PRICING_MODEL_KEYWORDS = {
+        'subscription': ['subscription', 'saas', 'annual fee', 'recurring'],
+        'perpetual': ['perpetual license', 'one-time license', 'permanent license'],
+        'per_user': ['per user', 'per seat', 'named user', 'concurrent user'],
+        'tiered': ['tiered pricing', 'volume discount', 'tier 1', 'tier 2'],
+        'population_based': ['population-based', 'per capita', 'based on population'],
+    }
+    
+    # What's included indicators
+    INCLUDED_KEYWORDS = {
+        'Software License': ['software license', 'license grant', 'right to use'],
+        'Maintenance/Support': ['maintenance', 'support services', 'technical support', 'help desk'],
+        'Implementation': ['implementation', 'configuration', 'setup', 'installation'],
+        'Training': ['training', 'user training', 'admin training'],
+        'Hosting': ['hosting', 'cloud hosting', 'saas', 'data center'],
+        'Data Migration': ['data migration', 'data conversion', 'import'],
+        'Customization': ['customization', 'custom development', 'modifications'],
+        'Integrations': ['integration', 'api', 'interface', 'third-party'],
+    }
+    
+    @classmethod
+    def analyze(cls, text: str, company: str, product: str) -> Dict:
+        """
+        Analyze document text and return structured findings.
+        """
+        text_lower = text.lower()
+        
+        results = {
+            'prices_found': [],
+            'dates_found': [],
+            'term': None,
+            'pricing_model': [],
+            'included_items': [],
+            'has_company': company.lower() in text_lower,
+            'has_product': product.lower() in text_lower,
+            'summary': '',
+            'key_findings': [],
+        }
+        
+        # === EXTRACT PRICES ===
+        for pattern, label in cls.PRICE_PATTERNS:
+            matches = re.finditer(pattern, text_lower)
+            for match in matches:
+                try:
+                    amount_str = match.group(1).replace(',', '')
+                    amount = float(amount_str)
+                    if amount >= 100:  # Filter tiny amounts
+                        results['prices_found'].append({
+                            'amount': amount,
+                            'formatted': f"${amount:,.0f}",
+                            'type': label
+                        })
+                except:
+                    pass
+        
+        # Deduplicate prices
+        seen_amounts = set()
+        unique_prices = []
+        for p in sorted(results['prices_found'], key=lambda x: x['amount'], reverse=True):
+            if p['amount'] not in seen_amounts:
+                seen_amounts.add(p['amount'])
+                unique_prices.append(p)
+        results['prices_found'] = unique_prices[:8]
+        
+        # === EXTRACT DATES ===
+        for pattern, label in cls.DATE_PATTERNS:
+            match = re.search(pattern, text_lower)
+            if match:
+                results['dates_found'].append({
+                    'date': match.group(1),
+                    'type': label
+                })
+        
+        # === EXTRACT TERM ===
+        for pattern, label in cls.TERM_PATTERNS:
+            match = re.search(pattern, text_lower)
+            if match:
+                term_value = int(match.group(1))
+                if 'month' in label:
+                    results['term'] = f"{term_value} months"
+                else:
+                    results['term'] = f"{term_value} year{'s' if term_value > 1 else ''}"
+                break
+        
+        # === DETECT PRICING MODEL ===
+        for model, keywords in cls.PRICING_MODEL_KEYWORDS.items():
+            if any(kw in text_lower for kw in keywords):
+                results['pricing_model'].append(model)
+        
+        # === DETECT WHAT'S INCLUDED ===
+        for item, keywords in cls.INCLUDED_KEYWORDS.items():
+            if any(kw in text_lower for kw in keywords):
+                results['included_items'].append(item)
+        
+        # === BUILD KEY FINDINGS ===
+        if results['prices_found']:
+            top_price = results['prices_found'][0]
+            results['key_findings'].append(f"💰 {top_price['type']}: {top_price['formatted']}")
+        
+        if results['term']:
+            results['key_findings'].append(f"📅 {results['term']} term")
+        
+        if results['dates_found']:
+            for d in results['dates_found'][:2]:
+                results['key_findings'].append(f"📅 {d['type']}: {d['date']}")
+        
+        if results['pricing_model']:
+            models = ', '.join(results['pricing_model'][:2])
+            results['key_findings'].append(f"💳 Pricing: {models}")
+        
+        if results['included_items']:
+            items = ', '.join(results['included_items'][:4])
+            results['key_findings'].append(f"📦 Includes: {items}")
+        
+        # === BUILD SUMMARY ===
+        summary_parts = []
+        
+        # Product/Company mention (IMPORTANT)
+        if results['has_company'] and results['has_product']:
+            summary_parts.append(f"✓ MENTIONS: {company} + {product}")
+        elif results['has_company']:
+            summary_parts.append(f"✓ MENTIONS: {company} only (no {product})")
+        elif results['has_product']:
+            summary_parts.append(f"✓ MENTIONS: {product} only (no {company})")
+        else:
+            summary_parts.append(f"⚠ WARNING: Neither {company} nor {product} mentioned")
+        
+        if results['prices_found']:
+            prices_str = '; '.join([f"{p['type']}: {p['formatted']}" for p in results['prices_found'][:3]])
+            summary_parts.append(f"PRICING: {prices_str}")
+        else:
+            summary_parts.append("PRICING: Not found in document")
+        
+        if results['term']:
+            summary_parts.append(f"TERM: {results['term']}")
+        
+        if results['dates_found']:
+            dates_str = '; '.join([f"{d['type']}: {d['date']}" for d in results['dates_found'][:2]])
+            summary_parts.append(f"DATES: {dates_str}")
+        
+        if results['pricing_model']:
+            summary_parts.append(f"MODEL: {', '.join(results['pricing_model'])}")
+        
+        if results['included_items']:
+            summary_parts.append(f"INCLUDES: {', '.join(results['included_items'][:5])}")
+        
+        results['summary'] = ' | '.join(summary_parts)
+        
+        return results
+
+
+def analyze_pdf_document(url: str, company: str, product: str, timeout: int = 30) -> Dict:
+    """
+    Download and analyze a PDF document.
+    Returns analysis results or error status.
+    If direct download fails, tries browser-based download (Chrome with VPN).
+    """
+    result = {
+        'status': 'unknown',
+        'analysis': None,
+        'error': None,
+        'download_method': None,
+    }
+    
+    # Try direct download first
+    pdf_bytes = download_pdf(url, timeout)
+    
+    if pdf_bytes:
+        result['download_method'] = 'direct'
+    else:
+        # Try browser-based download (uses Chrome which may have VPN)
+        pdf_bytes = download_pdf_via_browser(url, timeout)
+        if pdf_bytes:
+            result['download_method'] = 'browser'
+    
+    if not pdf_bytes:
+        result['status'] = 'download_failed'
+        result['error'] = 'Could not download PDF (tried direct + browser)'
+        return result
+    
+    # Extract text
+    text = extract_pdf_text(pdf_bytes, max_pages=15)
+    if not text.strip():
+        result['status'] = 'no_text'
+        result['error'] = 'Could not extract text (may be scanned/image PDF)'
+        return result
+    
+    # Analyze content
+    analysis = ContentAnalyzer.analyze(text, company, product)
+    result['status'] = 'analyzed'
+    result['analysis'] = analysis
+    result['text_length'] = len(text)
+    
+    return result
+
+
+def download_pdf_via_browser(url: str, timeout: int = 30) -> Optional[bytes]:
+    """
+    Download PDF using Playwright browser (for sites that block direct requests).
+    Uses Chrome channel which may have VPN extensions enabled.
+    """
+    try:
+        with sync_playwright() as p:
+            # Try to use Chrome (may have VPN) instead of Chromium
+            try:
+                browser = p.chromium.launch(headless=True, channel="chrome")
+            except:
+                # Fall back to Chromium if Chrome not available
+                browser = p.chromium.launch(headless=True)
+            
+            context = browser.new_context(
+                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+            )
+            page = context.new_page()
+            
+            # Navigate to PDF
+            response = page.goto(url, timeout=timeout * 1000, wait_until='networkidle')
+            
+            if response and response.status == 200:
+                content = response.body()
+                browser.close()
+                return content
+            
+            browser.close()
+            return None
+    except Exception as e:
+        return None
+
+
+def batch_analyze_documents(results: List[Dict], company: str, product: str,
+                           max_to_analyze: int = 15) -> List[Dict]:
+    """
+    Analyze PDF documents and add analysis to results.
+    After analysis, re-scores results based on content findings.
+    """
+    has_pdfplumber, has_pymupdf = check_pdf_libraries()
+    
+    if not has_pdfplumber and not has_pymupdf:
+        print("\n  ⚠️ No PDF library available!")
+        print("  Install with: pip install pdfplumber")
+        print("  Or: pip install pymupdf")
+        return results
+    
+    # Filter to PDFs only
+    pdf_results = [r for r in results if '.pdf' in r['url'].lower()][:max_to_analyze]
+    
+    if not pdf_results:
+        print("\n  No PDFs found to analyze")
+        return results
+    
+    print(f"\n  Analyzing {len(pdf_results)} PDFs for pricing and contract details...")
+    print(f"  (This may take 1-2 minutes)\n")
+    
+    for i, result in enumerate(pdf_results, 1):
+        title_short = result.get('title', '')[:45]
+        print(f"  [{i}/{len(pdf_results)}] {title_short}...")
+        
+        try:
+            analysis_result = analyze_pdf_document(result['url'], company, product)
+            result['content_analysis'] = analysis_result
+            
+            if analysis_result['status'] == 'analyzed':
+                analysis = analysis_result['analysis']
+                
+                # Show download method if browser was used
+                if analysis_result.get('download_method') == 'browser':
+                    print(f"           🌐 Downloaded via browser (VPN)")
+                
+                # Show key findings
+                if analysis['prices_found']:
+                    top_price = analysis['prices_found'][0]
+                    print(f"           💰 {top_price['type']}: {top_price['formatted']}")
+                else:
+                    print(f"           📄 No pricing found")
+                
+                if analysis['term']:
+                    print(f"           📅 Term: {analysis['term']}")
+                
+                # Show product/company mention
+                if analysis.get('has_product') and analysis.get('has_company'):
+                    print(f"           ✓ Mentions {company} + {product}")
+                elif analysis.get('has_company'):
+                    print(f"           ⚠️ Mentions {company} only (no {product})")
+                elif analysis.get('has_product'):
+                    print(f"           ⚠️ Mentions {product} only (no {company})")
+                else:
+                    print(f"           ❌ Neither {company} nor {product} mentioned")
+                    
+            elif analysis_result['status'] == 'download_failed':
+                print(f"           ❌ Download failed (direct + browser)")
+            elif analysis_result['status'] == 'no_text':
+                print(f"           ⚠️ Could not extract text (scanned PDF?)")
+                
+        except Exception as e:
+            print(f"           ❌ Error: {str(e)[:40]}")
+            result['content_analysis'] = {
+                'status': 'error',
+                'error': str(e)
+            }
+        
+        time.sleep(0.5)  # Be nice to servers
+    
+    # Summary
+    analyzed = sum(1 for r in results if r.get('content_analysis', {}).get('status') == 'analyzed')
+    with_pricing = sum(1 for r in results 
+                      if r.get('content_analysis', {}).get('status') == 'analyzed'
+                      and r.get('content_analysis', {}).get('analysis')
+                      and r['content_analysis']['analysis'].get('prices_found'))
+    
+    print(f"\n  ✓ Analyzed {analyzed} documents, {with_pricing} contain pricing information")
+    
+    # === RE-SCORE BASED ON CONTENT ANALYSIS ===
+    print("\n  Re-scoring based on content analysis...")
+    results = rescore_after_analysis(results, company, product)
+    
+    return results
+
+
+def rescore_after_analysis(results: List[Dict], company: str, product: str) -> List[Dict]:
+    """
+    Re-score results based on PDF content analysis findings.
+    Adjusts scores based on:
+    - Whether pricing was found (+2.0)
+    - Whether product is mentioned (+1.5) or not mentioned (-2.0)
+    - Whether company is mentioned (+1.0) or not mentioned (-1.5)
+    - Contract term found (+0.5)
+    """
+    for result in results:
+        ca = result.get('content_analysis', {})
+        
+        if ca.get('status') != 'analyzed':
+            continue
+        
+        analysis = ca.get('analysis')
+        if not analysis:
+            continue
+        
+        score_adjustments = []
+        original_score = result.get('relevance_score', 0)
+        
+        # Pricing found bonus
+        if analysis.get('prices_found'):
+            result['relevance_score'] += 2.0
+            score_adjustments.append("+2.0 pricing found")
+        
+        # Product mention check
+        if analysis.get('has_product'):
+            result['relevance_score'] += 1.5
+            score_adjustments.append(f"+1.5 {product} mentioned")
+        else:
+            result['relevance_score'] -= 2.0
+            score_adjustments.append(f"-2.0 {product} NOT mentioned")
+        
+        # Company mention check
+        if analysis.get('has_company'):
+            result['relevance_score'] += 1.0
+            score_adjustments.append(f"+1.0 {company} mentioned")
+        else:
+            result['relevance_score'] -= 1.5
+            score_adjustments.append(f"-1.5 {company} NOT mentioned")
+        
+        # Term found bonus
+        if analysis.get('term'):
+            result['relevance_score'] += 0.5
+            score_adjustments.append("+0.5 term found")
+        
+        # Ensure score doesn't go negative
+        result['relevance_score'] = max(result['relevance_score'], 0)
+        
+        # Add adjustments to breakdown
+        if score_adjustments:
+            if 'score_breakdown' not in result:
+                result['score_breakdown'] = []
+            result['score_breakdown'].extend(score_adjustments)
+            result['content_score_adjustment'] = result['relevance_score'] - original_score
+    
+    # Re-sort by new scores
+    results.sort(key=lambda x: x.get('relevance_score', 0), reverse=True)
+    
+    # Show score changes
+    changes = [(r['title'][:30], r.get('content_score_adjustment', 0)) 
+               for r in results if r.get('content_score_adjustment', 0) != 0]
+    
+    if changes:
+        print(f"  Score adjustments made to {len(changes)} results")
+        for title, adj in changes[:5]:
+            sign = "+" if adj > 0 else ""
+            print(f"    {sign}{adj:.1f}: {title}...")
+    
+    return results
 
 
 # =============================================================================
@@ -318,15 +845,11 @@ def is_pdf_url(url: str) -> bool:
 # =============================================================================
 
 def extract_location(url: str, title: str) -> str:
-    """
-    Extract location (city/county/state) from URL and title.
-    Returns formatted string like "Hillsboro, OR" or "San Francisco County, CA"
-    """
+    """Extract location from URL and title."""
     url_lower = url.lower()
     title_lower = title.lower()
     text = url_lower + " " + title_lower
     
-    # US State abbreviations and full names
     states = {
         'alabama': 'AL', 'alaska': 'AK', 'arizona': 'AZ', 'arkansas': 'AR',
         'california': 'CA', 'colorado': 'CO', 'connecticut': 'CT', 'delaware': 'DE',
@@ -352,7 +875,7 @@ def extract_location(url: str, title: str) -> str:
     
     domain = get_domain(url)
     
-    # Pattern: city-state in domain (hillsboro-oregon)
+    # Pattern: city-state in domain
     domain_match = re.search(r'([a-z]+)-([a-z]+)\.(?:civicweb|legistar)', domain)
     if domain_match:
         potential_city = domain_match.group(1)
@@ -361,7 +884,7 @@ def extract_location(url: str, title: str) -> str:
             found_city = potential_city.title()
             found_state_abbrev = states[potential_state]
     
-    # Pattern: citySTATE.gov (berkeleyca.gov, galvestontx.gov)
+    # Pattern: citySTATE.gov
     if not found_city:
         domain_match = re.search(r'(?:www\.)?([a-z]+)(ca|tx|ny|fl|wa|or|az|co|il|oh|pa|ga|nc|nj|va|ma|mi|md|mn|mo|wi|tn|in|ks|ne|nv)\.gov', domain)
         if domain_match:
@@ -382,12 +905,6 @@ def extract_location(url: str, title: str) -> str:
             found_county = domain_match.group(1).title()
             found_state_abbrev = domain_match.group(2).upper()
     
-    # Pattern: COUNTYcounty.gov
-    if not found_city and not found_county:
-        domain_match = re.search(r'(?:www\.)?([a-z]+)county\.(?:gov|org|us)', domain)
-        if domain_match:
-            found_county = domain_match.group(1).title()
-    
     # Pattern: state-level sites
     if not found_city and not found_county:
         domain_match = re.search(r'(?:state|das|dgs|doa)\.([a-z]{2})\.(?:us|gov)', domain)
@@ -395,26 +912,17 @@ def extract_location(url: str, title: str) -> str:
             found_state_abbrev = domain_match.group(1).upper()
             is_state_level = True
     
-    # Known cities database
+    # Known cities
     known_cities = {
         'anaheim': 'CA', 'berkeley': 'CA', 'san diego': 'CA', 'san francisco': 'CA',
         'los angeles': 'CA', 'oakland': 'CA', 'sacramento': 'CA', 'fresno': 'CA',
-        'long beach': 'CA', 'santa ana': 'CA', 'palo alto': 'CA', 'santa barbara': 'CA',
         'galveston': 'TX', 'houston': 'TX', 'dallas': 'TX', 'austin': 'TX',
-        'san antonio': 'TX', 'fort worth': 'TX', 'arlington': 'TX', 'plano': 'TX',
         'tacoma': 'WA', 'seattle': 'WA', 'spokane': 'WA', 'bellevue': 'WA',
         'hillsboro': 'OR', 'portland': 'OR', 'salem': 'OR', 'eugene': 'OR',
-        'denver': 'CO', 'colorado springs': 'CO', 'aurora': 'CO', 'boulder': 'CO',
-        'phoenix': 'AZ', 'tucson': 'AZ', 'mesa': 'AZ', 'scottsdale': 'AZ', 'goodyear': 'AZ',
-        'charlotte': 'NC', 'raleigh': 'NC', 'durham': 'NC', 'greensboro': 'NC',
-        'tampa': 'FL', 'miami': 'FL', 'orlando': 'FL', 'jacksonville': 'FL', 'brevard': 'FL',
-        'papillion': 'NE', 'omaha': 'NE', 'lincoln': 'NE',
-        'andover': 'KS', 'wichita': 'KS', 'kansas city': 'KS',
-        'moreno valley': 'CA', 'moval': 'CA', 'merced': 'CA', 'stanislaus': 'CA',
-        'stockton': 'CA', 'modesto': 'CA', 'fontana': 'CA', 'mendocino': 'CA',
-        'columbus': 'OH', 'cleveland': 'OH', 'cincinnati': 'OH',
-        'watertown': 'NY', 'buffalo': 'NY', 'rochester': 'NY', 'albany': 'NY',
-        'butte': 'MT', 'silver bow': 'MT', 'silverbow': 'MT',
+        'denver': 'CO', 'phoenix': 'AZ', 'goodyear': 'AZ',
+        'charlotte': 'NC', 'tampa': 'FL', 'miami': 'FL', 'brevard': 'FL',
+        'papillion': 'NE', 'omaha': 'NE', 'andover': 'KS',
+        'moreno valley': 'CA', 'moval': 'CA', 'merced': 'CA',
         'washoe': 'NV', 'kern': 'CA', 'evanston': 'IL', 'mulberry': 'FL',
     }
     
@@ -429,40 +937,18 @@ def extract_location(url: str, title: str) -> str:
                     found_state_abbrev = state
                 break
     
-    # "City of X" pattern
-    city_of_match = re.search(r'city of ([a-z\s]+?)(?:,|\s*-|\s*\||$)', text)
-    if city_of_match and not found_city:
-        found_city = city_of_match.group(1).strip().title()
-    
-    # "County of X" pattern
-    county_of_match = re.search(r'county of ([a-z\s]+?)(?:,|\s*-|\s*\||$)', text)
-    if county_of_match and not found_county:
-        found_county = county_of_match.group(1).strip().title()
-    
-    # State in text
-    if not found_state_abbrev:
-        for state_name, abbrev in states.items():
-            if state_name in text:
-                found_state_abbrev = abbrev
-                break
-    
-    # Build final location string
+    # Build location string
     if is_state_level and found_state_abbrev:
-        state_full = abbrev_to_full.get(found_state_abbrev, found_state_abbrev)
-        return f"State of {state_full}"
+        return f"State of {abbrev_to_full.get(found_state_abbrev, found_state_abbrev)}"
     
     if found_county and found_state_abbrev:
-        county_name = found_county.replace(' County', '').replace(' county', '')
-        return f"{county_name} County, {found_state_abbrev}"
+        return f"{found_county} County, {found_state_abbrev}"
     
     if found_city and found_state_abbrev:
         return f"{found_city}, {found_state_abbrev}"
     
     if found_city:
         return found_city
-    
-    if found_county:
-        return f"{found_county} County"
     
     if found_state_abbrev:
         return found_state_abbrev
@@ -474,21 +960,19 @@ def extract_location(url: str, title: str) -> str:
 # SEARCH QUERY GENERATION
 # =============================================================================
 
-def generate_search_queries(company: str, product: str, context: str, 
-                           search_type: str = 'software') -> List[Dict[str, str]]:
-    """Generate search queries with metadata."""
+def generate_search_queries(company: str, product: str, search_type: str = 'software') -> List[Dict]:
+    """Generate search queries."""
     queries = []
     
-    # HIGH PRIORITY - Order forms and direct agreements (best for pricing)
+    # Order forms (best for pricing)
     order_form_queries = [
-        (f'"{company}" "order form" pdf', 'order_form'),
-        (f'"{company}" "renewal order form" pdf', 'order_form'),
-        (f'"{company}" "subscription services agreement" pdf', 'agreement'),
-        (f'"{company}" "master services agreement" pdf', 'agreement'),
-        (f'"{company}" "{product}" "order form" pdf', 'order_form'),
+        (f'"{company}" order form pdf', 'order_form'),
+        (f'"{company}" renewal order form pdf', 'order_form'),
+        (f'"{company}" subscription services agreement pdf', 'agreement'),
+        (f'"{company}" master services agreement pdf', 'agreement'),
     ]
     
-    # Contract/Agreement queries
+    # Contract queries
     contract_queries = [
         (f'"{company}" "{product}" contract pdf', 'contract'),
         (f'"{company}" "{product}" agreement pdf', 'agreement'),
@@ -497,30 +981,26 @@ def generate_search_queries(company: str, product: str, context: str,
         (f'"{company}" contract renewal pdf', 'renewal'),
     ]
     
-    # Pricing-specific queries
+    # Pricing queries
     pricing_queries = [
         (f'"{company}" "{product}" pricing schedule pdf', 'pricing'),
         (f'"{company}" "{product}" fee schedule pdf', 'pricing'),
         (f'"{company}" "{product}" cost proposal pdf', 'pricing'),
-        (f'"{company}" "exhibit" pricing pdf', 'pricing'),
     ]
     
     # Software license queries
     software_queries = [
         (f'"{company}" "{product}" software license agreement pdf', 'software_license'),
-        (f'"{company}" "{product}" software subscription pdf', 'software_license'),
         (f'"{company}" "{product}" SaaS agreement pdf', 'software_license'),
     ]
     
-    # Government document queries (lower priority - summaries, not full contracts)
-    gov_doc_queries = [
+    # Gov document queries
+    gov_queries = [
         (f'"{company}" "{product}" staff report pdf', 'staff_report'),
-        (f'"{company}" "{product}" council agenda pdf', 'agenda'),
         (f'"{company}" civicweb contract', 'civicweb'),
         (f'site:civicweb.net "{company}" contract', 'civicweb'),
     ]
     
-    # Build query list with priorities
     for q, cat in order_form_queries:
         queries.append({'query': q, 'category': cat, 'priority': 'highest'})
     
@@ -534,7 +1014,7 @@ def generate_search_queries(company: str, product: str, context: str,
         for q, cat in software_queries:
             queries.append({'query': q, 'category': cat, 'priority': 'high'})
     
-    for q, cat in gov_doc_queries:
+    for q, cat in gov_queries:
         queries.append({'query': q, 'category': cat, 'priority': 'medium'})
     
     return queries
@@ -576,7 +1056,6 @@ def duckduckgo_search(query: str, max_results: int = 30) -> List[Dict[str, str]]
             
             time.sleep(1)
             
-            # Get results
             result_links = page.query_selector_all("a[data-testid='result-title-a']")
             for link in result_links:
                 try:
@@ -592,7 +1071,6 @@ def duckduckgo_search(query: str, max_results: int = 30) -> List[Dict[str, str]]
         finally:
             browser.close()
     
-    # Deduplicate
     seen = set()
     unique = []
     for r in results:
@@ -607,46 +1085,37 @@ def duckduckgo_search(query: str, max_results: int = 30) -> List[Dict[str, str]]
 # RESULT FILTERING & SCORING
 # =============================================================================
 
-def filter_result(result: Dict, company: str, product: str, 
-                 search_type: str = 'software') -> Tuple[bool, str]:
-    """Determine if a result should be included."""
+def filter_result(result: Dict, company: str, product: str) -> Tuple[bool, str]:
+    """Determine if result should be included."""
     url = result['url']
     title = result.get('title', '')
     text = (title + " " + url).lower()
     
-    # Check blocked domains
     is_blocked, blocked_domain = is_blocked_domain(url)
     if is_blocked:
         return False, f"Blocked domain: {blocked_domain}"
     
-    company_lower = company.lower()
-    product_lower = product.lower()
-    
-    has_company = company_lower in text
-    has_product = product_lower in text
-    
-    # Check user documentation
     if is_user_documentation(url, title):
         return False, "User documentation"
     
-    # Direct PDF from trusted domain
+    company_lower = company.lower()
+    product_lower = product.lower()
+    has_company = company_lower in text
+    has_product = product_lower in text
+    
     if is_pdf_url(url) and is_trusted_domain(url):
         return True, "PDF from trusted domain"
     
-    # PDF with good URL pattern
     if is_pdf_url(url) and has_good_url_pattern(url):
         return True, "PDF from document repository"
     
-    # Need company or product match
     if not has_company and not has_product:
         return False, "No company/product match"
     
-    # Contract keywords
     contract_keywords = [
         'contract', 'agreement', 'procurement', 'purchasing', 'rfp', 'bid',
         'proposal', 'memo', 'resolution', 'agenda', 'ordinance', 'staff report',
-        'sow', 'statement of work', 'award', 'amendment', 'renewal', 'pricing',
-        'order form', 'fee schedule',
+        'award', 'amendment', 'renewal', 'pricing', 'order form', 'fee schedule',
     ]
     
     if any(kw in text for kw in contract_keywords):
@@ -662,18 +1131,7 @@ def filter_result(result: Dict, company: str, product: str,
 
 
 def score_result(result: Dict, company: str, product: str) -> Tuple[float, List[str]]:
-    """
-    Score result on 0-10 scale.
-    
-    SCORING BREAKDOWN:
-    - Entity matching: max 3.0 (company +1.5, product +1.5)
-    - Document format: max 1.5 (PDF +1.5)
-    - Domain trust: max 2.5 (.gov +2.5, trusted +2.0, doc repo +1.0)
-    - Document type: max 2.5 (Order Form +2.5, Contract +2.0, Pricing +2.0, Staff Report +1.0)
-    - High-value title: max 2.5 (based on title patterns)
-    - Recency: max 1.0 (2024+ = +1.0, 2022+ = +0.5)
-    - Penalties: user doc -3.0, login page -2.0
-    """
+    """Score result on 0-10 scale."""
     score = 0.0
     reasons = []
     url = result['url'].lower()
@@ -683,7 +1141,7 @@ def score_result(result: Dict, company: str, product: str) -> Tuple[float, List[
     company_lower = company.lower()
     product_lower = product.lower()
     
-    # === ENTITY MATCHING (max 3.0) ===
+    # Entity matching (max 3.0)
     if company_lower in text:
         score += 1.5
         reasons.append("+1.5 company")
@@ -691,12 +1149,12 @@ def score_result(result: Dict, company: str, product: str) -> Tuple[float, List[
         score += 1.5
         reasons.append("+1.5 product")
     
-    # === DOCUMENT FORMAT (max 1.5) ===
+    # Document format (max 1.5)
     if is_pdf_url(url):
         score += 1.5
         reasons.append("+1.5 PDF")
     
-    # === DOMAIN TRUST (max 2.5) ===
+    # Domain trust (max 2.5)
     if '.gov' in url:
         score += 2.5
         reasons.append("+2.5 .gov")
@@ -707,7 +1165,7 @@ def score_result(result: Dict, company: str, product: str) -> Tuple[float, List[
         score += 1.0
         reasons.append("+1.0 doc repo")
     
-    # === DOCUMENT TYPE BONUS (max 2.5) ===
+    # Document type bonus (max 2.5)
     doc_type, doc_info = DocumentType.classify(url, title)
     
     if doc_type == 'Order Form':
@@ -726,17 +1184,17 @@ def score_result(result: Dict, company: str, product: str) -> Tuple[float, List[
         score += 0.5
         reasons.append("+0.5 rfp/proposal")
     
-    # === HIGH-VALUE TITLE PATTERNS (max 2.5) ===
+    # High-value title patterns (max 2.5)
     title_bonus = 0.0
     for pattern, bonus in SearchConfig.HIGH_VALUE_TITLE_PATTERNS.items():
         if pattern in title:
-            title_bonus = max(title_bonus, bonus)  # Take highest match
+            title_bonus = max(title_bonus, bonus)
     
     if title_bonus > 0:
         score += title_bonus
         reasons.append(f"+{title_bonus} title pattern")
     
-    # === RECENCY (max 1.0) ===
+    # Recency (max 1.0)
     years = re.findall(r'20(2[0-6]|1[9])', text)
     if years:
         latest = max(int('20' + y) for y in years)
@@ -747,7 +1205,7 @@ def score_result(result: Dict, company: str, product: str) -> Tuple[float, List[
             score += 0.5
             reasons.append(f"+0.5 {latest}")
     
-    # === PENALTIES ===
+    # Penalties
     if is_user_documentation(url, title):
         score -= 3.0
         reasons.append("-3.0 user doc")
@@ -756,20 +1214,18 @@ def score_result(result: Dict, company: str, product: str) -> Tuple[float, List[
         score -= 2.0
         reasons.append("-2.0 login page")
     
-    # Store document type for later use
     result['document_type'] = doc_type
     result['pricing_likely'] = doc_info['pricing_likely']
     
     return max(round(score, 1), 0.0), reasons
 
 
-def process_results(results: List[Dict], company: str, product: str,
-                   search_type: str = 'software', verbose: bool = False) -> List[Dict]:
+def process_results(results: List[Dict], company: str, product: str) -> List[Dict]:
     """Filter and score all results."""
     processed = []
     
     for result in results:
-        include, reason = filter_result(result, company, product, search_type)
+        include, reason = filter_result(result, company, product)
         
         if include:
             score, score_reasons = score_result(result, company, product)
@@ -777,8 +1233,6 @@ def process_results(results: List[Dict], company: str, product: str,
             result['score_breakdown'] = score_reasons
             result['include_reason'] = reason
             processed.append(result)
-        elif verbose:
-            print(f"      Excluded: {reason} - {result.get('title', '')[:40]}")
     
     processed.sort(key=lambda x: x['relevance_score'], reverse=True)
     return processed
@@ -808,12 +1262,9 @@ def deduplicate_results(results: List[Dict]) -> List[Dict]:
     return list(seen.values())
 
 
-def apply_location_diversity(results: List[Dict], penalty_per_duplicate: float = 1.5, 
+def apply_location_diversity(results: List[Dict], penalty_per_duplicate: float = 1.5,
                             max_penalty: float = 4.0) -> List[Dict]:
-    """
-    Apply diversity penalty to results from the same location.
-    First result from each location gets no penalty, subsequent results get increasing penalties.
-    """
+    """Apply diversity penalty to results from same location."""
     location_counts = {}
     
     for result in results:
@@ -821,20 +1272,17 @@ def apply_location_diversity(results: List[Dict], penalty_per_duplicate: float =
         result['location'] = location
         
         if location == 'Unknown':
-            continue  # Don't penalize unknown locations
+            continue
         
         count = location_counts.get(location, 0)
         if count > 0:
-            # Apply penalty for duplicate locations
             penalty = min(count * penalty_per_duplicate, max_penalty)
-            original_score = result['relevance_score']
             result['relevance_score'] = max(result['relevance_score'] - penalty, 0)
             result['score_breakdown'].append(f"-{penalty:.1f} location #{count+1}")
             result['diversity_penalty'] = penalty
         
         location_counts[location] = count + 1
     
-    # Re-sort after applying penalties
     results.sort(key=lambda x: x['relevance_score'], reverse=True)
     return results
 
@@ -846,14 +1294,13 @@ def apply_location_diversity(results: List[Dict], penalty_per_duplicate: float =
 def display_results(results: List[Dict], company: str, product: str, show_breakdown: bool = False):
     """Display formatted results."""
     print(f"\n{'=' * 80}")
-    print("TOP RESULTS (sorted by relevance with location diversity)")
+    print("TOP RESULTS")
     print('=' * 80)
     
     for i, r in enumerate(results[:20], 1):
         score = r.get('relevance_score', 0)
         valid = r.get('link_valid')
         
-        # Status indicator
         if valid is True:
             status = "✓"
         elif valid is False:
@@ -864,10 +1311,7 @@ def display_results(results: List[Dict], company: str, product: str, show_breakd
         bar = '█' * int(score) + '░' * (10 - int(score))
         cat = "HIGH" if score >= 7 else ("MED " if score >= 5 else "LOW ")
         
-        # Get location
-        location = r.get('location') or extract_location(r['url'], r.get('title', ''))
-        
-        # Get document type
+        location = r.get('location', 'Unknown')
         doc_type = r.get('document_type', 'Unknown')
         pricing_likely = r.get('pricing_likely', False)
         pricing_indicator = "💰" if pricing_likely else "📄"
@@ -877,6 +1321,13 @@ def display_results(results: List[Dict], company: str, product: str, show_breakd
         print(f"    {pricing_indicator} [{doc_type}] {r['title'][:65]}")
         print(f"    {r['url'][:100]}")
         
+        # Show content analysis if available
+        if r.get('content_analysis', {}).get('status') == 'analyzed':
+            analysis = r['content_analysis']['analysis']
+            if analysis.get('key_findings'):
+                for finding in analysis['key_findings'][:3]:
+                    print(f"       {finding}")
+        
         if show_breakdown and r.get('score_breakdown'):
             print(f"    Scoring: {'; '.join(r['score_breakdown'][:5])}")
         
@@ -884,74 +1335,83 @@ def display_results(results: List[Dict], company: str, product: str, show_breakd
             print(f"    ⚠ Link issue: {r.get('link_status_reason', 'Unknown')}")
 
 
-def save_results(results: List[Dict], company: str, product: str, 
-                context: str, search_type: str, filename: str):
+def save_results(results: List[Dict], company: str, product: str, filename: str):
     """Save results to JSON and CSV."""
     
-    # === SAVE JSON ===
+    # JSON output
     output = {
         'metadata': {
             'company': company,
             'product': product,
-            'search_type': search_type,
             'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
             'total_results': len(results),
-            'version': '7.0',
+            'version': '7.5',
         },
         'results': []
     }
     
     for i, r in enumerate(results):
-        location = r.get('location') or extract_location(r['url'], r.get('title', ''))
-        doc_type = r.get('document_type', 'Unknown')
-        
-        output['results'].append({
+        result_data = {
             'rank': i + 1,
             'score': r['relevance_score'],
             'title': r['title'],
             'url': r['url'],
-            'location': location,
-            'document_type': doc_type,
+            'location': r.get('location', 'Unknown'),
+            'document_type': r.get('document_type', 'Unknown'),
             'pricing_likely': r.get('pricing_likely', False),
             'link_valid': r.get('link_valid'),
             'score_breakdown': r.get('score_breakdown', []),
-        })
+        }
+        
+        # Add content analysis if available
+        if r.get('content_analysis', {}).get('status') == 'analyzed':
+            analysis = r['content_analysis']['analysis']
+            result_data['content_summary'] = analysis.get('summary', '')
+            result_data['prices_found'] = analysis.get('prices_found', [])
+            result_data['contract_term'] = analysis.get('term')
+            result_data['key_findings'] = analysis.get('key_findings', [])
+        
+        output['results'].append(result_data)
     
     with open(filename, 'w', encoding='utf-8') as f:
         json.dump(output, f, indent=2, ensure_ascii=False)
     print(f"✓ Saved JSON to {filename}")
     
-    # === SAVE CSV ===
+    # CSV output
     csv_filename = filename.replace('.json', '.csv')
-    if csv_filename == filename:
-        csv_filename = filename + '.csv'
     
     with open(csv_filename, 'w', encoding='utf-8') as f:
-        # Header - simplified and cleaner
-        f.write('Rank,Score,Category,Link,Location,Document_Type,Pricing_Likely,Title,URL\n')
+        f.write('Rank,Score,Category,Link,Location,Document_Type,Pricing_Likely,Content_Summary,Title,URL\n')
         
         for i, r in enumerate(results, 1):
             score = r.get('relevance_score', 0)
             category = "HIGH" if score >= 7 else ("MEDIUM" if score >= 5 else "LOW")
             
-            # Link validity
             valid = r.get('link_valid')
-            if valid is True:
-                link_status = "✓"
-            elif valid is False:
-                link_status = "✗"
-            else:
-                link_status = "?"
+            link_status = "✓" if valid is True else ("✗" if valid is False else "?")
             
-            location = r.get('location') or extract_location(r['url'], r.get('title', ''))
+            location = r.get('location', 'Unknown')
             doc_type = r.get('document_type', 'Unknown')
             pricing_likely = "Yes" if r.get('pricing_likely', False) else "No"
             
+            # Get content summary
+            content_summary = ""
+            if r.get('content_analysis', {}).get('status') == 'analyzed':
+                analysis = r['content_analysis']['analysis']
+                content_summary = analysis.get('summary', '')
+            elif r.get('content_analysis', {}).get('status') == 'no_text':
+                content_summary = "Could not extract text (scanned PDF)"
+            elif r.get('content_analysis', {}).get('status') == 'download_failed':
+                content_summary = "Download failed"
+            else:
+                content_summary = "Not analyzed"
+            
             # Escape for CSV
+            content_summary = content_summary.replace('"', "'").replace(',', ';').replace('\n', ' ')
             title = r.get('title', '').replace('"', '""').replace('\n', ' ')
             url = r.get('url', '')
             
-            f.write(f'{i},{score},{category},{link_status},"{location}","{doc_type}",{pricing_likely},"{title}","{url}"\n')
+            f.write(f'{i},{score},{category},{link_status},"{location}","{doc_type}",{pricing_likely},"{content_summary}","{title}","{url}"\n')
     
     print(f"✓ Saved CSV to {csv_filename}")
 
@@ -962,14 +1422,25 @@ def save_results(results: List[Dict], company: str, product: str,
 
 def main():
     print("=" * 80)
-    print("GOVERNMENT CONTRACT SEARCH v7.0")
+    print("GOVERNMENT CONTRACT SEARCH v7.5")
     print("=" * 80)
-    print("\nImprovements in v7:")
+    print("\nFeatures:")
     print("  ✓ Location diversity (avoids duplicate locations at top)")
     print("  ✓ Simplified document types (6 types, focused on pricing)")
-    print("  ✓ Better title pattern matching (Order Form, Agreement, etc.)")
-    print("  ✓ Fixed: Staff reports no longer classified as contracts")
-    print("  ✓ Order Forms ranked higher (best for pricing)")
+    print("  ✓ PDF content analysis with pricing extraction")
+    print("  ✓ Contract term and date detection")
+    print("  ✓ Document summary generation")
+    
+    # Check PDF libraries
+    has_pdfplumber, has_pymupdf = check_pdf_libraries()
+    print("\nPDF Libraries:")
+    print(f"  PyMuPDF: {'✓ Available' if has_pymupdf else '✗ Not installed'}")
+    print(f"  pdfplumber: {'✓ Available' if has_pdfplumber else '✗ Not installed'}")
+    
+    if not has_pdfplumber and not has_pymupdf:
+        print("\n  ⚠️ Install a PDF library for content analysis:")
+        print("     pip install pdfplumber")
+        print("     pip install pymupdf")
     
     # Get inputs
     company = input("\nCompany name: ").strip()
@@ -986,8 +1457,7 @@ def main():
     search_type = {'1': 'software', '2': 'implementation', '3': 'both'}.get(
         input("Choice (1-3, default 3): ").strip() or "3", 'both')
     
-    # Generate and run queries
-    queries = generate_search_queries(company, product, "", search_type)
+    queries = generate_search_queries(company, product, search_type)
     
     try:
         num_queries = int(input(f"\nQueries to run (1-{len(queries)}, default 10): ").strip() or "10")
@@ -1006,7 +1476,7 @@ def main():
         raw = duckduckgo_search(q['query'], max_results=25)
         print(f"  Found: {len(raw)} results")
         
-        processed = process_results(raw, company, product, search_type, verbose=False)
+        processed = process_results(raw, company, product)
         print(f"  Kept: {len(processed)} relevant")
         
         all_results.extend(processed)
@@ -1039,6 +1509,16 @@ def main():
     print("\nApplying location diversity...")
     all_results = apply_location_diversity(all_results)
     
+    # PDF content analysis
+    if has_pdfplumber or has_pymupdf:
+        analyze = input("\nAnalyze PDF content for pricing/dates? (y/n, default y): ").strip().lower() != 'n'
+        if analyze:
+            try:
+                max_pdfs = int(input("Max PDFs to analyze (default 15): ").strip() or "15")
+            except:
+                max_pdfs = 15
+            all_results = batch_analyze_documents(all_results, company, product, max_to_analyze=max_pdfs)
+    
     # Display
     display_results(all_results, company, product, show_breakdown=True)
     
@@ -1048,11 +1528,10 @@ def main():
         filename = input(f"Filename (default: {default_name}): ").strip() or default_name
         if not filename.endswith('.json'):
             filename += '.json'
-        save_results(all_results, company, product, "", search_type, filename)
+        save_results(all_results, company, product, filename)
     
     print("\n✓ Done!")
 
 
 if __name__ == "__main__":
     main()
-    
